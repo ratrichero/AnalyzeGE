@@ -1,118 +1,81 @@
-import os
-import math
 import logging
 import asyncio
-from decimal import Decimal, ROUND_DOWN
+import re
+import ccxt.async_support as ccxt
 import pandas as pd
 from cachetools import TTLCache
-
-# Các thư viện Binance và Telegram
-from binance.client import Client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 )
 
-# Cấu hình LOGGING
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
-)
+# --- CẤU HÌNH CƠ BẢN ---
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# CONFIG ĐỊNH CẤU HÌNH HỆ THỐNG
-USE_API_KEY = False  
-BINANCE_API_KEY = ""
-BINANCE_API_SECRET = ""
+# Thay Token của bồ tèo vào đây
 TELEGRAM_BOT_TOKEN = "8895435477:AAEMGY0vpdNzreyMF7LGIvi1aXIo-KO9Sho"
 
-# -------------------------------------------------------------------------
-# 1. DATA LAYER: QUẢN LÝ DỮ LIỆU BINANCE & TTL CACHE
-# -------------------------------------------------------------------------
+# ==========================================
+# 1. KHỐI LẤY DỮ LIỆU SÀN BINANCE (DÙNG CCXT)
+# ==========================================
 class BinanceDataFactory:
     def __init__(self):
-        if USE_API_KEY and BINANCE_API_KEY and BINANCE_API_SECRET:
-            self.client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-            logger.info("Khởi tạo Binance Client với API Key cá nhân.")
-        else:
-            self.client = Client("", "")
-            logger.info("Khởi tạo Binance Client ở chế độ Public (Mặc định).")
-            
-        self.candle_cache = TTLCache(maxsize=1000, ttl=60)
-        self.symbol_info = {}
-        self.load_exchange_info()
+        # Dùng CCXT né lỗi IP Restricted cực tốt, không tự động ping khi khởi tạo
+        self.exchange = ccxt.binance({
+            'options': {'defaultType': 'future'},
+            'enableRateLimit': True,
+        })
+        self.candle_cache = TTLCache(maxsize=1000, ttl=60) # Cache 60 giây chống block API
 
-    def load_exchange_info(self):
-        try:
-            info = self.client.futures_exchange_info()
-            for s in info['symbols']:
-                if s['contractType'] == 'PERPETUAL':
-                    tick_size = next(f['tickSize'] for f in s['filters'] if f['filterType'] == 'PRICE_FILTER')
-                    precision = abs(Decimal(str(tick_size)).normalize().as_tuple().exponent)
-                    self.symbol_info[s['symbol'].upper()] = {
-                        'pricePrecision': int(s['pricePrecision']),
-                        'quantityPrecision': int(s['quantityPrecision']),
-                        'tickSize': tick_size,
-                        'decimal_places': precision
-                    }
-            logger.info("Đã tải thông tin cấu trúc cặp giao dịch Binance Futures thành công.")
-        except Exception as e:
-            logger.error(f"Lỗi khi tải exchange info: {e}")
-
-    def format_price(self, symbol, price):
-        info = self.symbol_info.get(symbol.upper())
-        if not info:
-            return f"{price:.4f}"
-        places = info['decimal_places']
-        return f"{price:.{places}f}"
-
-    def get_candles(self, symbol, interval, limit=150):
-        symbol = symbol.upper()
+    async def get_candles(self, symbol, interval, limit=150):
+        # Format lại symbol cho chuẩn CCXT (VD: BTCUSDT -> BTC/USDT)
+        ccxt_symbol = symbol.replace('USDT', '') + '/USDT'
         cache_key = f"{symbol}_{interval}"
         
         if cache_key in self.candle_cache:
             return self.candle_cache[cache_key]
         
         try:
-            bars = self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-            df = pd.DataFrame(bars, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume', 
-                'close_time', 'quote_asset_volume', 'number_of_trades', 
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-            ])
-            df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
+            ohlcv = await self.exchange.fetch_ohlcv(ccxt_symbol, timeframe=interval, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             self.candle_cache[cache_key] = df
             return df
         except Exception as e:
-            logger.error(f"Lỗi API Binance khi lấy nến {symbol} [{interval}]: {e}")
+            logger.error(f"Lỗi tải dữ liệu CCXT cho {symbol}: {e}")
             return None
 
-# -------------------------------------------------------------------------
-# 2. ANALYSIS ENGINE: PHÂN TÍCH TIÊU CHUẨN KỸ THUẬT
-# -------------------------------------------------------------------------
-class MarketAnalyzer:
-    def __init__(self, data_factory: BinanceDataFactory):
-        self.factory = data_factory
+    def format_price(self, symbol, price):
+        # Đơn giản hóa việc format (hiển thị 5 số thập phân nếu giá quá nhỏ, 2 nếu giá lớn)
+        if price < 0.1:
+            return f"{price:.6f}"
+        elif price < 10:
+            return f"{price:.4f}"
+        else:
+            return f"{price:.2f}"
 
-    def analyze_single_frame(self, symbol, interval):
-        df = self.factory.get_candles(symbol, interval)
+# ==========================================
+# 2. KHỐI PHÂN TÍCH KỸ THUẬT (PANDAS THUẦN)
+# ==========================================
+class MarketAnalyzer:
+    def __init__(self, factory):
+        self.factory = factory
+
+    async def analyze_single_frame(self, symbol, interval):
+        df = await self.factory.get_candles(symbol, interval)
         if df is None or df.empty or len(df) < 50:
             return None
 
         last_close = df['close'].iloc[-1]
 
-        # --- TỰ TÍNH EMA VÀ RSI BẰNG PANDAS THUẦN (KHÔNG DÙNG PANDAS_TA) ---
-        # Tính EMA 20 và EMA 50
+        # --- Tự tính toán Indicators bằng Pandas ---
+        # 1. EMA 20 & 50
         df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
         df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
         ema20 = df['EMA_20'].iloc[-1]
         ema50 = df['EMA_50'].iloc[-1]
-        
-        # Tính RSI 14 chuẩn Wilder's
+
+        # 2. RSI 14 (Chuẩn Wilder's)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
@@ -120,14 +83,14 @@ class MarketAnalyzer:
         df['RSI'] = 100 - (100 / (1 + rs))
         rsi = df['RSI'].iloc[-1]
 
-        # Tính Bollinger Bands (Độ lệch chuẩn std=2)
+        # 3. Bollinger Bands (20, 2)
         df['BB_mid'] = df['close'].rolling(window=20).mean()
         df['BB_std'] = df['close'].rolling(window=20).std()
         bb_upper = df['BB_mid'].iloc[-1] + (2 * df['BB_std'].iloc[-1])
         bb_lower = df['BB_mid'].iloc[-1] - (2 * df['BB_std'].iloc[-1])
-        # -----------------------------------------------------------------
 
-        # Nhóm 1: Xu hướng (Trend)
+        # --- Phân loại Trạng Thái ---
+        # Nhóm 1: Xu hướng
         if last_close > ema20 > ema50:
             trend = "🟢 TĂNG MẠNH (Bullish)"
             trend_score = 2
@@ -141,335 +104,334 @@ class MarketAnalyzer:
             trend = "🟡 GIẢM NHẸ / ĐI NGANG"
             trend_score = -1
 
-        # Nhóm 2: Động lượng (Momentum)
+        # Nhóm 2: Động lượng
         if rsi > 70: momentum = f"🔥 QUÁ MUA ({rsi:.1f})"
         elif rsi < 30: momentum = f"❄️ QUÁ BÁN ({rsi:.1f})"
         else: momentum = f"⚖️ TRUNG TÍNH ({rsi:.1f})"
 
-        # Nhóm 3: Biến động (Volatility)
+        # Nhóm 3: Biến động
         bb_bandwidth = ((bb_upper - bb_lower) / df['BB_mid'].iloc[-1]) * 100
         volatility = "💥 CAO (Mở băng)" if bb_bandwidth > 5 else "💤 THẤP (Bóp băng - Sideway)"
 
-        # Nhóm 4: Khối lượng (Volume)
+        # Nhóm 4: Khối lượng
         avg_vol = df['volume'].iloc[-20:-1].mean()
         last_vol = df['volume'].iloc[-1]
         volume_status = "🐋 ĐỘT BIẾN (Gấp đôi TB)" if last_vol > avg_vol * 2 else "💎 ỔN ĐỊNH"
 
-        # Nhóm 5: Hỗ trợ / Kháng cự
+        # Nhóm 5: Hỗ trợ / Kháng cự cứng (30 nến)
         support = df['low'].rolling(window=30).min().iloc[-1]
         resistance = df['high'].rolling(window=30).max().iloc[-1]
 
-        # --- ĐOẠN ĐỀ XUẤT RISK:REWARD ĐỘNG ĐÃ SỬA ---
-        trade_plan = ""
-        price_step = last_close * 0.005 # Biên độ nhiễu 0.5%
+        # --- Tính toán Risk:Reward Động ---
+        total_range = resistance - support
+        
+        # Thiết lập hệ số quản lý vốn (SL % và TP % tối thiểu dựa trên Entry)
+        if interval == '15m':
+            sl_pct, tp1_pct, tp2_pct = 0.003, 0.006, 0.012  # SL 0.3%, TP1 0.6%, TP2 1.2% (R:R chuẩn 1:2)
+        elif interval == '1h':
+            sl_pct, tp1_pct, tp2_pct = 0.006, 0.012, 0.025  # SL 0.6%, TP1 1.2%, TP2 2.5%
+        elif interval == '4h':
+            sl_pct, tp1_pct, tp2_pct = 0.015, 0.030, 0.060  # SL 1.5%, TP1 3.0%, TP2 6.0%
+        else: # Khung 1D
+            sl_pct, tp1_pct, tp2_pct = 0.030, 0.060, 0.120  # SL 3.0%, TP1 6.0%, TP2 12.0%
 
+        price_step = last_close * 0.002
+        
+        # --- XỬ LÝ CHIẾN LƯỢC CHO XU HƯỚNG TĂNG ---
         if trend_score > 0:
-            tp1_target = resistance
-            tp2_target = resistance * 1.03
-            tp_distance = tp1_target - last_close
-            calculated_sl = last_close - (tp_distance / 1.5)
-            final_sl = max(calculated_sl, support * 0.995)
+            entry_normal = last_close - price_step
+            tp1_normal = resistance
+            final_sl = support * 0.995
             
-            trade_plan = (
-                "🎯 **Hướng đề xuất: LONG (MUA CƠ CẤU)**\n"
-                f" ├ Entry (Hồi nhẹ): `{self.factory.format_price(symbol, last_close - price_step)}`\n"
-                f" ├ Stop Loss (SL): `{self.factory.format_price(symbol, final_sl)}` (Tối ưu R:R)\n"
-                f" └ Take Profit (TP): TP1: `{self.factory.format_price(symbol, tp1_target)}` | TP2: `{self.factory.format_price(symbol, tp2_target)}`"
-            )
+            risk_normal = entry_normal - final_sl
+            reward_normal = tp1_normal - entry_normal
+            
+            # KIỂM TRA R:R: Nếu giá quá sát cản (Ăn ít lỗ nhiều), chuyển sang LONG BREAKOUT
+            if reward_normal < risk_normal:
+                entry_breakout = resistance * 1.002
+                # Tính toán mục tiêu TUYỆT ĐỐI dựa trên giá trị Entry mới
+                sl_breakout = entry_breakout * (1 - sl_pct)
+                tp1_breakout = entry_breakout * (1 + tp1_pct)
+                tp2_breakout = entry_breakout * (1 + tp2_pct)
+                
+                trade_plan = (
+                    f"🔥 **Chiến lược: LONG BREAKOUT (MUA PHÁ VỠ - KHUNG {interval.upper()})**\n"
+                    "⚠️ *Trạng thái:* Giá quá sát Kháng cự, không mua đuổi. Chờ phá vỡ hẳn để kích hoạt!\n"
+                    f" ├ 🟢 Điểm vào (Entry): `{self.factory.format_price(symbol, entry_breakout)}` (Khi nến đóng trên cản)\n"
+                    f" ├ 🔴 Cắt lỗ (Stop Loss): `{self.factory.format_price(symbol, sl_breakout)}` (R:R chuẩn khung nhỏ)\n"
+                    f" └ 🎯 Chốt lời (Take Profit): TP1: `{self.factory.format_price(symbol, tp1_breakout)}` | TP2: `{self.factory.format_price(symbol, tp2_breakout)}`"
+                )
+            else:
+                trade_plan = (
+                    f"🔥 **Chiến lược: LONG (MUA THUẬN XU HƯỚNG - KHUNG {interval.upper()})**\n"
+                    f" ├ 🟢 Điểm vào (Entry hồi): `{self.factory.format_price(symbol, entry_normal)}`\n"
+                    f" ├ 🔴 Cắt lỗ (Stop Loss): `{self.factory.format_price(symbol, final_sl)}` (Dưới hỗ trợ cứng)\n"
+                    f" └ 🎯 Chốt lời (Take Profit): TP1: `{self.factory.format_price(symbol, tp1_normal)}` | TP2: `{self.factory.format_price(symbol, entry_normal + (risk_normal * 2))}`"
+                )
+            
+        # --- XỬ LÝ CHIẾN LƯỢC CHO XU HƯỚNG GIẢM ---
         elif trend_score < 0:
-            tp1_target = support
-            tp2_target = support * 0.97
-            tp_distance = last_close - tp1_target
-            calculated_sl = last_close + (tp_distance / 1.5)
-            final_sl = min(calculated_sl, resistance * 1.005)
+            entry_normal = last_close + price_step
+            tp1_normal = support
+            final_sl = resistance * 1.005
             
-            trade_plan = (
-                "🎯 **Hướng đề xuất: SHORT (BÁN KHỐNG)**\n"
-                f" ├ Entry (Hồi xanh): `{self.factory.format_price(symbol, last_close + price_step)}`\n"
-                f" ├ Stop Loss (SL): `{self.factory.format_price(symbol, final_sl)}` (Tối ưu R:R)\n"
-                f" └ Take Profit (TP): TP1: `{self.factory.format_price(symbol, tp1_target)}` | TP2: `{self.factory.format_price(symbol, tp2_target)}`"
-            )
+            risk_normal = final_sl - entry_normal
+            reward_normal = entry_normal - tp1_normal
+            
+            # KIỂM TRA R:R SHORT: Nếu giá quá sát hỗ trợ, chuyển sang SHORT BREAKDOWN
+            if reward_normal < risk_normal:
+                entry_breakdown = support * 0.998
+                # Tính toán mục tiêu TUYỆT ĐỐI dựa trên giá trị Entry mới
+                sl_breakdown = entry_breakdown * (1 + sl_pct)
+                tp1_breakdown = entry_breakdown * (1 - tp1_pct)
+                tp2_breakdown = entry_breakdown * (1 - tp2_pct)
+                
+                trade_plan = (
+                    f"🔥 **Chiến lược: SHORT BREAKDOWN (BÁN PHÁ VỠ - KHUNG {interval.upper()})**\n"
+                    "⚠️ *Trạng thái:* Giá quá sát Hỗ trợ, không bán đuổi. Chờ sập đáy để kích hoạt!\n"
+                    f" ├ 🔴 Điểm vào (Entry): `{self.factory.format_price(symbol, entry_breakdown)}` (Khi nến đóng dưới hỗ trợ)\n"
+                    f" ├ 🟢 Cắt lỗ (Stop Loss): `{self.factory.format_price(symbol, sl_breakdown)}` (R:R chuẩn khung nhỏ)\n"
+                    f" └ 🎯 Chốt lời (Take Profit): TP1: `{self.factory.format_price(symbol, tp1_breakdown)}` | TP2: `{self.factory.format_price(symbol, tp2_breakdown)}`"
+                )
+            else:
+                trade_plan = (
+                    f"🔥 **Chiến lược: SHORT (BÁN THUẬN XU HƯỚNG - KHUNG {interval.upper()})**\n"
+                    f" ├ 🔴 Điểm vào (Entry hồi): `{self.factory.format_price(symbol, entry_normal)}`\n"
+                    f" ├ 🟢 Cắt lỗ (Stop Loss): `{self.factory.format_price(symbol, final_sl)}` (Trên kháng cự cứng)\n"
+                    f" └ 🎯 Chốt lời (Take Profit): TP1: `{self.factory.format_price(symbol, tp1_normal)}` | TP2: `{self.factory.format_price(symbol, entry_normal - (risk_normal * 2))}`"
+                )
+                
+        # --- XỬ LÝ CHIẾN LƯỢC KHI THỊ TRƯỜNG ĐI NGANG (SIDEWAY) ---
         else:
+            entry_long = support * 1.002
+            entry_short = resistance * 0.998
+            
+            # Đánh biên độ ngắn theo khung thời gian phát triển
             trade_plan = (
-                "⚠️ **Trạng thái:** Sideway trong biên độ nến.\n"
-                f"🟩 **Kịch bản LONG:** Entry `{self.factory.format_price(symbol, support * 1.002)}` | SL `{self.factory.format_price(symbol, support * 0.992)}` | TP `{self.factory.format_price(symbol, last_close)}`\n"
-                f"🟥 **Kịch bản SHORT:** Entry `{self.factory.format_price(symbol, resistance * 0.998)}` | SL `{self.factory.format_price(symbol, resistance * 1.008)}` | TP `{self.factory.format_price(symbol, last_close)}`"
+                f"⚠️ **Chiến lược: SWING TRADING (ĐÁNH TRONG BIÊN ĐỘ SIDEWAY - KHUNG {interval.upper()})**\n"
+                f"🟩 **Kịch bản LONG:** Entry vùng hỗ trợ `{self.factory.format_price(symbol, entry_long)}` | SL `{self.factory.format_price(symbol, entry_long * (1 - sl_pct))}` | TP `{self.factory.format_price(symbol, resistance * 0.995)}`\n"
+                f"🟥 **Kịch bản SHORT:** Entry vùng kháng cự `{self.factory.format_price(symbol, entry_short)}` | SL `{self.factory.format_price(symbol, entry_short * (1 + sl_pct))}` | TP `{self.factory.format_price(symbol, support * 1.005)}`"
             )
 
         return {
-            "trend": trend, "trend_score": trend_score, "rsi": rsi,
-            "momentum": momentum, "volatility": volatility, "volume": volume_status,
-            "support": support, "resistance": resistance, "close": last_close,
-            "trade_plan": trade_plan
+            "trend": trend, "rsi": rsi, "momentum": momentum,
+            "volatility": volatility, "volume": volume_status,
+            "support": support, "resistance": resistance,
+            "close": last_close, "trade_plan": trade_plan
         }
-    
-    def generate_mtf_recommendation(self, symbol):
-        intervals = ['15m', '1h', '4h', '1D']
-        results = {}
-        
-        for idx in intervals:
-            res = self.analyze_single_frame(symbol, idx)
-            if res: results[idx] = res
-            
-        if not results or '4h' not in results:
-            return "❌ Không đủ dữ liệu đa khung để phân tích cặp này."
 
-        total_score = (
-            results.get('1D', {}).get('trend_score', 0) * 3 +
-            results.get('4h', {}).get('trend_score', 0) * 2.5 +
-            results.get('1h', {}).get('trend_score', 0) * 1.5 +
-            results.get('15m', {}).get('trend_score', 0) * 1.0
-        )
-        
-        current_price = results['4h']['close']
-        sup_4h = results['4h']['support']
-        res_4h = results['4h']['resistance']
-        
-        report = f"📊 **STRATEGY REPORT: {symbol.upper()}**\n"
-        report += f"💵 Giá hiện tại: `{self.factory.format_price(symbol, current_price)}`\n"
-        report += "-----------------------------------------\n"
-        
-        report += "🔍 **Cấu trúc xu hướng đa khung:**\n"
-        for idx in intervals:
-            if idx in results:
-                report += f" ├ Khung {idx}: {results[idx]['trend']}\n"
-        
-        is_sideway = abs(total_score) <= 3.0 or (45 <= results['4h']['rsi'] <= 55)
-        
-        if is_sideway:
-            report += "\n⚠️ **TRẠNG THÁI: MARKET SIDEWAY (Biên độ hẹp)**\n"
-            report += "👉 *Chiến lược đề xuất: Range Trading (Đánh theo biên độ)*\n\n"
-            
-            entry_long = sup_4h * 1.002
-            sl_long = sup_4h * 0.99
-            tp1_long = current_price
-            tp2_long = res_4h * 0.995
-            
-            entry_short = res_4h * 0.998
-            sl_short = res_4h * 1.01
-            tp1_short = current_price
-            tp2_short = sup_4h * 1.005
-            
-            report += f"🟩 **Kịch bản LONG (Mua hỗ trợ):**\n"
-            report += f" ├ Entry: `{self.factory.format_price(symbol, entry_long)}`\n"
-            report += f" ├ SL: `{self.factory.format_price(symbol, sl_long)}`\n"
-            report += f" └ TP: `{self.factory.format_price(symbol, tp1_long)}` | `{self.factory.format_price(symbol, tp2_long)}`\n\n"
-
-            report += f"🟥 **Kịch bản SHORT (Bán kháng cự):**\n"
-            report += f" ├ Entry: `{self.factory.format_price(symbol, entry_short)}`\n"
-            report += f" ├ SL: `{self.factory.format_price(symbol, sl_short)}`\n"
-            report += f" └ TP: `{self.factory.format_price(symbol, tp1_short)}` | `{self.factory.format_price(symbol, tp2_short)}`\n"
-            
-            reason = "Các khung giờ triệt tiêu tín hiệu xu hướng, RSI đi ngang tích lũy chặt chẽ."
-            invalidation = f"Nến 4h breakout đóng cửa ngoài biên độ `{self.factory.format_price(symbol, sup_4h)}` hoặc `{self.factory.format_price(symbol, res_4h)}`."
-            
-        else:
-            if total_score > 0:
-                direction = "🟢 LONG (MUA)"
-                confidence = "🔥 Cao" if total_score > 6 else "⚡ Trung Bình"
-                entry = current_price * 0.995
-                sl = results['4h']['support'] * 0.995
-                tp1 = current_price * 1.02
-                tp2 = results['4h']['resistance']
-                reason = "Xu hướng đa khung đồng thuận hướng lên, dòng tiền đổ vào mạnh."
-                invalidation = f"Giá sập mạnh thủng qua mức hỗ trợ cấu trúc tại `{self.factory.format_price(symbol, sl)}`."
-            else:
-                direction = "🔴 SHORT (BÁN)"
-                confidence = "🔥 Cao" if total_score < -6 else "⚡ Trung Bình"
-                entry = current_price * 1.005
-                sl = results['4h']['resistance'] * 1.005
-                tp1 = current_price * 0.98
-                tp2 = results['4h']['support']
-                reason = "Áp lực cung đè nặng toàn bộ cấu trúc MTF, EMA tạo giao cắt tử thần."
-                invalidation = f"Giá đảo chiều tăng mạnh vượt qua mốc kháng cự cấu trúc `{self.factory.format_price(symbol, sl)}`."
-
-            report += f"\n🎯 **HƯỚNG ĐỀ XUẤT CHÍNH: {direction}**\n"
-            report += f" ├ Độ tin cậy: {confidence} (Score: {total_score})\n"
-            report += f" ├ Entry đề xuất: `{self.factory.format_price(symbol, entry)}`\n"
-            report += f" ├ Stop Loss (SL): `{self.factory.format_price(symbol, sl)}`\n"
-            report += f" └ Take Profit: TP1: `{self.factory.format_price(symbol, tp1)}` | TP2: `{self.factory.format_price(symbol, tp2)}`\n"
-
-        report += "\n-----------------------------------------\n"
-        report += f"ℹ️ **Lý do giải thích:** {reason}\n"
-        report += f"❌ **Điều kiện hủy bỏ lệnh:** {invalidation}\n\n"
-        report += "🛡️ **QUẢN TRỊ RỦI RO:**\n"
-        report += " └ Tuyệt đối không rủi ro quá 2% tài khoản cho mỗi vị thế trading."
-        
-        return report
-
+# ==========================================
+# 3. GIAO DIỆN & XỬ LÝ TELEGRAM
+# ==========================================
 binance_factory = BinanceDataFactory()
 analyzer = MarketAnalyzer(binance_factory)
 
-# -------------------------------------------------------------------------
-# 3. INTERFACE LAYER: ĐIỀU HƯỚNG MENU TELEGRAM
-# -------------------------------------------------------------------------
-def validate_and_format_symbol(text: str) -> str:
-    symbol = text.strip().upper()
-    if not symbol:
-        return None
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
-    if symbol in binance_factory.symbol_info:
-        return symbol
-    return None
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 **Chào mừng bạn đến với Bot Phân Tích Crypto Đa Khung Chuyên Nghiệp!**\n\n"
-        "⚡ **Trải nghiệm tối giản hóa:**\n"
-        "👉 Nhập trực tiếp tên mã Coin mong muốn vào khung chat (Ví dụ: `btc`, `sol`, `eth`...).\n"
-        "Bot sẽ tự động định dạng và mở menu chức năng tương ứng ngay lập tức!"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def handle_raw_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    symbol = validate_and_format_symbol(user_text)
-    
-    if not symbol:
-        await update.message.reply_text(
-            f"❌ Không tìm thấy cặp giao dịch nào khớp với từ khóa `{user_text.upper()}` trên Binance Futures.\n\n"
-            "📌 *Mẹo:* Chỉ cần nhập tên viết tắt như `BTC`, `SOL`, `ETH`, `NEAR`...",
-            parse_mode="Markdown"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        welcome_msg = (
+            "🤖 **GE ANALYZE FUTURE BOT SẴN SÀNG!**\n\n"
+            "Nhập tên coin bạn muốn phân tích (Ví dụ: `BTC`, `SOL`, `PEPE`)"
         )
-        return
+        await update.message.reply_text(welcome_msg, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"⚠️ Lỗi nghiêm trọng trong hàm start: {e}", exc_info=True)
 
-    await show_coin_main_menu(update, symbol)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message or not update.message.text:
+            return
 
-async def show_coin_main_menu(update: Update, symbol: str):
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 Phân Tích Đơn Khung", callback_data=f"ask_tf_{symbol}"),
-            InlineKeyboardButton("🎯 Chiến Lược Đa Khung (MTF)", callback_data=f"run_rec_{symbol}")
+        text = update.message.text.strip().upper()
+        
+        # Lọc ký tự thừa và thêm USDT nếu chưa có
+        symbol_raw = re.sub(r'[^A-Z0-9]', '', text)
+        if not symbol_raw:
+            await update.message.reply_text("❌ Tên coin không hợp lệ. Vui lòng nhập lại!")
+            return
+
+        if not symbol_raw.endswith("USDT"):
+            symbol = f"{symbol_raw}USDT"
+        else:
+            symbol = symbol_raw
+
+        keyboard = [
+            [
+                InlineKeyboardButton("15m", callback_data=f"{symbol}_15m"),
+                InlineKeyboardButton("1H", callback_data=f"{symbol}_1h"),
+                InlineKeyboardButton("4H", callback_data=f"{symbol}_4h"),
+                InlineKeyboardButton("1D", callback_data=f"{symbol}_1d"),
+                InlineKeyboardButton("ALL", callback_data=f"{symbol}_MULTI")
+            ]
         ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    msg_text = f"✨ **DỮ LIỆU ĐÃ SẴN SÀNG: {symbol}**\n\nChọn một phương thức phân tích bên dưới:"
-    
-    if update.message:
-        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await update.callback_query.message.edit_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-
-async def ask_timeframe(update: Update, symbol: str):
-    keyboard = [
-        [
-            InlineKeyboardButton("15 Phút (15m)", callback_data=f"run_ana_{symbol}_15m"),
-            InlineKeyboardButton("1 Giờ (1h)", callback_data=f"run_ana_{symbol}_1h")
-        ],
-        [
-            InlineKeyboardButton("4 Giờ (4h)", callback_data=f"run_ana_{symbol}_4h"),
-            InlineKeyboardButton("1 Ngày (1D)", callback_data=f"run_ana_{symbol}_1D")
-        ],
-        [
-            InlineKeyboardButton("↩️ Quay lại Menu chính", callback_data=f"main_menu_{symbol}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    msg_text = f"⏱️ Chọn **khung thời gian** cần phân tích kỹ thuật cho cặp `{symbol}`:"
-    
-    if update.callback_query:
-        await update.callback_query.message.edit_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-
-async def execute_recommendation(update: Update, symbol: str):
-    is_callback = update.callback_query is not None
-    target_msg = update.callback_query.message if is_callback else update.message
-    
-    waiting_msg = await target_msg.reply_text(f"⏳ Hệ thống đang quét cấu trúc đa khung cho `{symbol}`. Vui lòng đợi...")
-    
-    loop = asyncio.get_event_loop()
-    report = await loop.run_in_executor(None, analyzer.generate_mtf_recommendation, symbol)
-    
-    nav_keyboard = [
-        [
-            InlineKeyboardButton("📊 Xem Phân Tích Đơn Khung", callback_data=f"ask_tf_{symbol}"),
-            InlineKeyboardButton("↩️ Menu chính", callback_data=f"main_menu_{symbol}")
-        ]
-    ]
-    await waiting_msg.edit_text(report, reply_markup=InlineKeyboardMarkup(nav_keyboard), parse_mode="Markdown")
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"🔍 Chọn khung thời gian phân tích cho **{symbol}**:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"⚠️ Lỗi xử lý tin nhắn (handle_message): {e}", exc_info=True)
+        try:
+            await update.message.reply_text("😥 Có lỗi hệ thống xảy ra khi phân tích coin này. Thử lại mã khác xem sao nhé!")
+        except Exception:
+            pass
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
-    # Bọc try...except để tránh crash khi lỗi hết hạn session của nút bấm
+    # 1. Bắt lỗi hết hạn session nút bấm sớm
     try:
         await query.answer()
     except Exception as e:
-        logger.warning(f"Không thể answer callback query (có thể do nút bấm hết hạn): {e}")
-
-    data = query.data
-
-    if data.startswith("main_menu_"):
-        symbol = data.replace("main_menu_", "")
-        await show_coin_main_menu(update, symbol)
-        
-    elif data.startswith("ask_tf_"):
-        symbol = data.replace("ask_tf_", "")
-        await ask_timeframe(update, symbol)
-        
-    elif data.startswith("run_rec_"):
-        symbol = data.replace("run_rec_", "")
-        await execute_recommendation(update, symbol)
-        
-    elif data.startswith("run_ana_"):
-        parts = data.replace("run_ana_", "").split("_")
-        symbol, interval = parts[0], parts[1]
-        
-        waiting_msg = await query.message.reply_text(f"⏳ Đang bóc tách chỉ báo `{symbol}` khung `{interval}`...")
-        
-        loop = asyncio.get_event_loop()
-        try:
-            res = await loop.run_in_executor(None, analyzer.analyze_single_frame, symbol, interval)
-        except Exception as e:
-            logger.error(f"Lỗi: {e}")
-            await waiting_msg.edit_text("❌ Lỗi cấu trúc API trong quá trình tính toán.")
-            return
-                
-        if not res:
-            await waiting_msg.edit_text("❌ Lỗi! Không nhận được phản hồi dữ liệu từ sàn.")
-            return
-
-        # Nối chuỗi báo cáo chuẩn sạch kèm KHUYẾN NGHỊ ĐỀ XUẤT THƯƠNG MẠI
-        report = (
-            f"📈 **PHÂN TÍCH ĐƠN KHUNG: {symbol} [{interval}]**\n"
-            f"💵 Giá hiện tại: `{binance_factory.format_price(symbol, res['close'])}`\n"
-            f"-----------------------------------------\n"
-            f"├── 🗺️ **Xu hướng (Trend):** {res['trend']}\n"
-            f"├── ⚡ **Động lượng (RSI):** {res['momentum']}\n"
-            f"├── 🌊 **Biến động (Bollinger):** {res['volatility']}\n"
-            f"├── 📊 **Khối lượng (Volume):** {res['volume']}\n"
-            f"└── 🛡️ **Vùng giá trị (S/R Cứng):**\n"
-            f"     ├ Kháng cự: `{binance_factory.format_price(symbol, res['resistance'])}`\n"
-            f"     └ Hỗ trợ: `{binance_factory.format_price(symbol, res['support'])}`\n\n"
-            f"{res['trade_plan']}"
-        )
-        
-        navigation_keyboard = [
-            [
-                InlineKeyboardButton("🔄 Đổi Khung Thời Gian", callback_data=f"ask_tf_{symbol}"),
-                InlineKeyboardButton("🎯 Xem Chiến Lược Đa Khung", callback_data=f"run_rec_{symbol}")
-            ],
-            [
-                InlineKeyboardButton("↩️ Quay lại Menu chính", callback_data=f"main_menu_{symbol}")
-            ]
-        ]
-        
-        await waiting_msg.edit_text(report, reply_markup=InlineKeyboardMarkup(navigation_keyboard), parse_mode="Markdown")
-
-def main():
-    if TELEGRAM_BOT_TOKEN == "THAY_TOKEN_TELEGRAM_BOT_CỦA_BẠN_VÀO_ĐÂY" or not TELEGRAM_BOT_TOKEN:
-        print("❌ LỖI: Điền Token của bạn vào trường cấu hình để khởi chạy.")
+        logger.warning(f"Lỗi Callback (Nút đã hết hạn hoặc bấm kép): {e}")
         return
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_raw_text_input))
+    # 2. Toàn bộ logic phân tích được bọc an toàn
+    try:
+        data = query.data
 
-    print("🚀 BOT ĐÃ ĐƯỢC CẬP NHẬT ĐỀ XUẤT ĐƠN KHUNG VÀ ĐANG CHẠY...")
-    application.run_polling()
+        # Nhánh xử lý khi bấm nút quay lại
+        if data == "BACK_TO_MENU":
+            back_msg = (
+                "🔄 **Mời bồ tèo nhập đồng coin mới!**\n"
+                "Hãy gõ tên coin muốn phân tích tiếp theo (Ví dụ: `BTC`, `ETH`...)"
+            )
+            await query.edit_message_text(back_msg, parse_mode='Markdown')
+            return
 
-if __name__ == "__main__":
-    main()
+        # Cắt chuỗi lấy cặp giao dịch và khung thời gian
+        symbol, interval = data.rsplit('_', 1)
+
+        # --- ĐOẠN XỬ LÝ PHÂN TÍCH ĐA KHUNG (MULTI) ---
+        if interval == "MULTI":
+            await query.edit_message_text(f"⏳ Đang quét và đối chiếu dữ liệu 4 khung thời gian cho {symbol}...")
+            
+            # Lấy dữ liệu nhanh của cả 4 khung
+            res15m = await analyzer.analyze_single_frame(symbol, "15m")
+            res1h = await analyzer.analyze_single_frame(symbol, "1h")
+            res4h = await analyzer.analyze_single_frame(symbol, "4h")
+            res1d = await analyzer.analyze_single_frame(symbol, "1d")
+            
+            if not all([res15m, res1h, res4h, res1d]):
+                await query.edit_message_text(f"❌ Không thể tải đủ dữ liệu đa khung cho {symbol}. Thử lại sau!")
+                return
+                
+            # Đánh giá độ đồng thuận xu hướng
+            trends = [res15m['trend'], res1h['trend'], res4h['trend'], res1d['trend']]
+            tang_count = sum(1 for t in trends if "TĂNG" in t)
+            giam_count = sum(1 for t in trends if "GIẢM" in t)
+            
+            if tang_count >= 3:
+                consensus = "🟢 ĐỒNG THUẬN TĂNG MẠNH (Ưu tiên LONG khi hồi giá)"
+            elif giam_count >= 3:
+                consensus = "🔴 ĐỒNG THUẬN GIẢM MẠNH (Ưu tiên SHORT khi hồi giá)"
+            else:
+                consensus = "🟡 THỊ TRƯỜNG PHÂN HÓA / XUNG ĐỘT XU HƯỚNG (Nên đứng ngoài)"
+
+            multi_report = (
+                f"🌐 **BÁO CÁO PHÂN TÍCH ĐA KHUNG (MTF): {symbol}**\n"
+                f"💵 Giá hiện tại: `{binance_factory.format_price(symbol, res1h['close'])}`\n"
+                "-----------------------------------------\n"
+                f"⏱️ **Khung ngắn (15m):** {res15m['trend']} | RSI: `{res15m['rsi']:.1f}`\n"
+                f"⏱️ **Khung vừa (1H):** {res1h['trend']} | RSI: `{res1h['rsi']:.1f}`\n"
+                f"⏱️ **Khung lớn (4H):** {res4h['trend']} | RSI: `{res4h['rsi']:.1f}`\n"
+                f"⏱️ **Khung Ngày (1D):** {res1d['trend']} | RSI: `{res1d['rsi']:.1f}`\n"
+                "-----------------------------------------\n"
+                f"🎯 **KẾT LUẬN ĐA KHUNG:**\n"
+                f"👉 **{consensus}**\n\n"
+                "💡 *Lời khuyên:* Chỉ nên vào lệnh lớn khi khung ngắn (15m/1H) chạy cùng hướng với khung lớn (4H/1D)."
+            )
+            
+            # Giao diện nút bấm quay lại
+            keyboard = [
+            [
+                InlineKeyboardButton("15m", callback_data=f"{symbol}_15m"),
+                InlineKeyboardButton("1H", callback_data=f"{symbol}_1h"),
+                InlineKeyboardButton("4H", callback_data=f"{symbol}_4h"),
+                InlineKeyboardButton("1D", callback_data=f"{symbol}_1d")
+            ],
+            [
+                InlineKeyboardButton("⬅️ Menu chính", callback_data="BACK_TO_MENU")
+            ]
+        ]
+            await query.edit_message_text(multi_report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
+        
+        await query.edit_message_text(f"⏳ Đang phân tích dữ liệu {symbol} khung {interval}...")
+
+        # Gọi hàm phân tích từ sàn
+        result = await analyzer.analyze_single_frame(symbol, interval)
+        
+        if not result:
+            await query.edit_message_text(f"❌ Không lấy được dữ liệu cho cặp {symbol}. Sàn Binance có thể không hỗ trợ mã này hoặc đang nghẽn mạng!")
+            return
+
+        # Tạo chuỗi nội dung báo cáo kết quả
+        report = (
+            f"📊 **PHÂN TÍCH ĐƠN KHUNG: {symbol} {interval}**\n"
+            f"💵 Giá hiện tại: `{binance_factory.format_price(symbol, result['close'])}`\n"
+            "-----------------------------------------\n"
+            f"├── 🗺️ Xu hướng: {result['trend']}\n"
+            f"├── ⚡ Động lượng: {result['momentum']}\n"
+            f"├── 🌊 Biến động: {result['volatility']}\n"
+            f"├── 📊 Khối lượng: {result['volume']}\n"
+            "└── 🛡️ Vùng giá trị (S/R Cứng):\n"
+            f"     ├ Kháng cự: `{binance_factory.format_price(symbol, result['resistance'])}`\n"
+            f"     └ Hỗ trợ: `{binance_factory.format_price(symbol, result['support'])}`\n\n"
+            f"{result['trade_plan']}"
+        )
+
+        # Tạo lại menu điều hướng
+        keyboard = [
+            [
+                InlineKeyboardButton("15m", callback_data=f"{symbol}_15m"),
+                InlineKeyboardButton("1H", callback_data=f"{symbol}_1h"),
+                InlineKeyboardButton("4H", callback_data=f"{symbol}_4h"),
+                InlineKeyboardButton("1D", callback_data=f"{symbol}_1d"),
+                InlineKeyboardButton("ALL", callback_data=f"{symbol}_MULTI")
+            ],
+            [
+                InlineKeyboardButton("⬅️ Menu chính", callback_data="BACK_TO_MENU")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(report, reply_markup=reply_markup, parse_mode='Markdown')
+
+    except Exception as e:
+        logger.error(f"⚠️ Lỗi nghiêm trọng tại handle_callback: {e}", exc_info=True)
+        try:
+            # Nếu có lỗi (Ví dụ CCXT lỗi, tính toán lỗi mảng trống), bot báo về Telegram thay vì đứng im
+            keyboard = [[InlineKeyboardButton("⬅️ Quay lại Menu", callback_data="BACK_TO_MENU")]]
+            await query.edit_message_text(
+                "💥 **Hệ thống phân tích gặp sự cố bất ngờ!**\n"
+                "Có thể do dữ liệu nến trên sàn bị ngắt quãng. Bồ tèo hãy thử lại sau hoặc chọn coin khác nhé.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        except Exception:
+            pass
+
+# ==========================================
+# 4. CHẠY BOT
+# ==========================================
+def main():
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    
+    logger.info("🚀 BOT ĐANG CHẠY BẰNG CCXT (NÉ LỖI IP) VÀ PANDAS THUẦN...")
+    app.run_polling()
+
+if __name__ == '__main__':
+    # Bản sửa lỗi khởi chạy loop chuẩn Python 3.10+
+    try:
+        main()
+    except RuntimeError as e:
+        if "asyncio.run() cannot be called from a running event loop" in str(e):
+            # Nếu loop đã chạy sẵn (một số môi trường đặc biệt), chạy thẳng hàm main qua loop cũ
+            loop = asyncio.get_event_loop()
+            loop.create_task(main())
+        else:
+            raise e

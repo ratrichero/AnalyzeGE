@@ -1,4 +1,4 @@
 python-telegram-bot==21.1.1
-python-binance==1.0.19
+ccxt==4.3.0
 pandas==2.2.2
 cachetools==5.4.0
