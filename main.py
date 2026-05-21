@@ -392,7 +392,13 @@ async def execute_recommendation(update: Update, symbol: str):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    
+    # Bọc try...except để tránh crash khi lỗi hết hạn session của nút bấm
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Không thể answer callback query (có thể do nút bấm hết hạn): {e}")
+
     data = query.data
 
     if data.startswith("main_menu_"):
