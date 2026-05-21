@@ -2,4 +2,4 @@ python-telegram-bot==21.1.1
 python-binance==1.0.19
 pandas==2.2.2
 cachetools==5.4.0
-https://github.com/twopirllc/pandas-ta/archive/refs/heads/development.zip
+https://github.com/twopirllc/pandas-ta/archive/master.tar.gz
