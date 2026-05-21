@@ -1,5 +1,5 @@
 python-telegram-bot==21.1.1
 python-binance==1.0.19
 pandas==2.2.2
-pandas-ta
 cachetools==5.4.0
+git+https://github.com/twopirllc/pandas-ta.git@development
